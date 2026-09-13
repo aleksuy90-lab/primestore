@@ -289,8 +289,7 @@ def main_menu():
         InlineKeyboardButton("💰 Баланс", callback_data="balance"),
         InlineKeyboardButton("👤 Профиль", callback_data="profile"),
         InlineKeyboardButton("📋 Мои заказы", callback_data="my_orders"),
-        InlineKeyboardButton("🆘 Поддержка", callback_data="support"),
-        InlineKeyboardButton("⚙️ Админ панель", callback_data="admin")
+        InlineKeyboardButton("🆘 Поддержка", callback_data="support")
     )
     return markup
 
