@@ -1,0 +1,1826 @@
+import sqlite3
+import random
+import string
+import time
+from datetime import datetime, timedelta
+from telebot import TeleBot, types
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import threading
+
+# ===== НАСТРОЙКИ =====
+TOKEN = "8769255778:AAHwcVSnpjAd8TLVMwJT7GPNZ9VzJQt2654"
+ADMIN_IDS = [8184136446]  # твой ID
+BOT_USERNAME = "@PrimeRbxStoreBot"
+
+bot = TeleBot(TOKEN)
+
+
+# ===== БД =====
+def init_db():
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+
+    # Пользователи
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+                  balance REAL DEFAULT 0, ref_link TEXT, ref_count INTEGER DEFAULT 0,
+                  bonus_used INTEGER DEFAULT 0, registered_at TEXT)''')
+
+    # Категории
+    c.execute('''CREATE TABLE IF NOT EXISTS categories
+                 (id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER DEFAULT 0,
+                  level INTEGER DEFAULT 0)''')
+
+    # Товары
+    c.execute('''CREATE TABLE IF NOT EXISTS products
+                 (id INTEGER PRIMARY KEY, name TEXT, description TEXT,
+                  price REAL, category_id INTEGER, subcategory_id INTEGER,
+                  auto_delivery INTEGER DEFAULT 1, delivery_data TEXT,
+                  require_code INTEGER DEFAULT 0, code_data TEXT)''')
+
+    # Заказы
+    c.execute('''CREATE TABLE IF NOT EXISTS orders
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, order_num TEXT UNIQUE,
+                  user_id INTEGER, product_id INTEGER, product_name TEXT,
+                  status TEXT DEFAULT 'new', created_at TEXT,
+                  amount REAL, payment_type TEXT, 
+                  delivery_data TEXT, code_data TEXT,
+                  completed_at TEXT, admin_comment TEXT)''')
+
+    # Промокоды
+    c.execute('''CREATE TABLE IF NOT EXISTS promocodes
+                 (id INTEGER PRIMARY KEY, code TEXT UNIQUE, discount_type TEXT,
+                  discount_value REAL, product_id INTEGER DEFAULT 0,
+                  valid_until TEXT, uses INTEGER DEFAULT 0, max_uses INTEGER DEFAULT 0,
+                  created_at TEXT)''')
+
+    # Настройки
+    c.execute('''CREATE TABLE IF NOT EXISTS settings
+                 (key TEXT PRIMARY KEY, value TEXT)''')
+
+    # Временные данные для админа
+    c.execute('''CREATE TABLE IF NOT EXISTS temp_product_data
+                 (user_id INTEGER, step TEXT, data TEXT,
+                  PRIMARY KEY (user_id, step))''')
+
+    # Скидки пользователей
+    c.execute('''CREATE TABLE IF NOT EXISTS user_discount
+                 (user_id INTEGER PRIMARY KEY, discount_type TEXT,
+                  discount_value REAL, product_id INTEGER DEFAULT 0)''')
+
+    # Вставляем настройки по умолчанию
+    c.execute(
+        "INSERT OR IGNORE INTO settings VALUES ('welcome_msg', 'Привет 👋,это лучший магазин цифровых товаров и услуг , выбери что тебе нужно 👇')")
+    c.execute("INSERT OR IGNORE INTO settings VALUES ('bonus_percent', '10')")
+    c.execute("INSERT OR IGNORE INTO settings VALUES ('bonus_enabled', '1')")
+    c.execute("INSERT OR IGNORE INTO settings VALUES ('notify_enabled', '1')")
+    c.execute("INSERT OR IGNORE INTO settings VALUES ('support_id', '8184136446')")
+    c.execute("INSERT OR IGNORE INTO settings VALUES ('order_prefix', 'SHOP')")
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+def get_setting(key):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key=?", (key,))
+    res = c.fetchone()
+    conn.close()
+    return res[0] if res else None
+
+
+def set_setting(key, value):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+
+def get_user(user_id):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE id=?", (user_id,))
+    res = c.fetchone()
+    conn.close()
+    return res
+
+
+def create_user(user_id, username, first_name):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    ref_link = f"{BOT_USERNAME}?start={user_id}"
+    c.execute("INSERT OR IGNORE INTO users (id, username, first_name, ref_link, registered_at) VALUES (?, ?, ?, ?, ?)",
+              (user_id, username, first_name, ref_link, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def add_balance(user_id, amount):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = balance + ? WHERE id=?", (amount, user_id))
+    conn.commit()
+    conn.close()
+
+
+def get_balance(user_id):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE id=?", (user_id,))
+    res = c.fetchone()
+    conn.close()
+    return res[0] if res else 0
+
+
+def generate_order_num():
+    prefix = get_setting('order_prefix') or 'SHOP'
+    timestamp = datetime.now().strftime('%y%m%d')
+    random_part = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"{prefix}-{timestamp}-{random_part}"
+
+
+def create_order(user_id, product_id, product_name, amount, payment_type, delivery_data='', code_data=''):
+    order_num = generate_order_num()
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    while True:
+        c.execute("SELECT id FROM orders WHERE order_num=?", (order_num,))
+        if not c.fetchone():
+            break
+        order_num = generate_order_num()
+
+    c.execute("""INSERT INTO orders 
+                 (order_num, user_id, product_id, product_name, amount, payment_type, 
+                  created_at, delivery_data, code_data, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+              (order_num, user_id, product_id, product_name, amount, payment_type,
+               datetime.now().isoformat(), delivery_data, code_data, 'new'))
+
+    order_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return order_id, order_num
+
+
+def get_order_by_num(order_num):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM orders WHERE order_num=?", (order_num,))
+    res = c.fetchone()
+    conn.close()
+    return res
+
+
+def update_order_status(order_num, status, admin_comment=''):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    if status == 'completed':
+        c.execute("UPDATE orders SET status=?, completed_at=?, admin_comment=? WHERE order_num=?",
+                  (status, datetime.now().isoformat(), admin_comment, order_num))
+    else:
+        c.execute("UPDATE orders SET status=?, admin_comment=? WHERE order_num=?",
+                  (status, admin_comment, order_num))
+    conn.commit()
+    conn.close()
+
+
+def get_product(product_id):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM products WHERE id=?", (product_id,))
+    res = c.fetchone()
+    conn.close()
+    return res
+
+
+def get_categories(parent_id=0):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM categories WHERE parent_id=? ORDER BY name", (parent_id,))
+    res = c.fetchall()
+    conn.close()
+    return res
+
+
+def get_products_by_subcategory(subcat_id):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM products WHERE subcategory_id=? ORDER BY name", (subcat_id,))
+    res = c.fetchall()
+    conn.close()
+    return res
+
+
+def get_promocode(code):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM promocodes WHERE code=? AND (valid_until IS NULL OR valid_until > datetime('now'))",
+              (code,))
+    res = c.fetchone()
+    conn.close()
+    return res
+
+
+def apply_promocode(user_id, code):
+    promo = get_promocode(code)
+    if not promo:
+        return False, "Промокод недействителен или истёк"
+
+    promo_id, promo_code, discount_type, discount_value, product_id, valid_until, uses, max_uses, created_at = promo
+
+    if max_uses > 0 and uses >= max_uses:
+        return False, "Лимит использований промокода исчерпан"
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+
+    if discount_type == 'balance':
+        add_balance(user_id, discount_value)
+        msg = f"Начислено {discount_value}₽ на баланс"
+    elif discount_type == 'discount_all':
+        c.execute("INSERT OR REPLACE INTO user_discount (user_id, discount_type, discount_value) VALUES (?, ?, ?)",
+                  (user_id, 'all', discount_value))
+        msg = f"Скидка {discount_value}% на все товары"
+    elif discount_type == 'discount_category':
+        c.execute(
+            "INSERT OR REPLACE INTO user_discount (user_id, discount_type, discount_value, product_id) VALUES (?, ?, ?, ?)",
+            (user_id, 'category', discount_value, product_id))
+        msg = f"Скидка {discount_value}% на товары из выбранной категории"
+    elif discount_type == 'discount_product':
+        c.execute(
+            "INSERT OR REPLACE INTO user_discount (user_id, discount_type, discount_value, product_id) VALUES (?, ?, ?, ?)",
+            (user_id, 'product', discount_value, product_id))
+        msg = f"Скидка {discount_value}% на выбранный товар"
+    else:
+        conn.close()
+        return False, "Неизвестный тип промокода"
+
+    c.execute("UPDATE promocodes SET uses = uses + 1 WHERE id=?", (promo_id,))
+    conn.commit()
+    conn.close()
+
+    return True, msg
+
+
+def get_user_orders(user_id, limit=10):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("""SELECT order_num, product_name, amount, status, created_at 
+                 FROM orders WHERE user_id=? 
+                 ORDER BY id DESC LIMIT ?""", (user_id, limit))
+    res = c.fetchall()
+    conn.close()
+    return res
+
+
+# ===== КЛАВИАТУРЫ =====
+def main_menu():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📦 Каталог", callback_data="catalog"),
+        InlineKeyboardButton("🎁 Бонусы", callback_data="bonuses"),
+        InlineKeyboardButton("💰 Баланс", callback_data="balance"),
+        InlineKeyboardButton("👤 Профиль", callback_data="profile"),
+        InlineKeyboardButton("📋 Мои заказы", callback_data="my_orders"),
+        InlineKeyboardButton("🆘 Поддержка", callback_data="support"),
+        InlineKeyboardButton("⚙️ Админ панель", callback_data="admin")
+    )
+    return markup
+
+
+def catalog_menu():
+    markup = InlineKeyboardMarkup(row_width=2)
+    categories = get_categories(0)
+    for cat in categories:
+        markup.add(InlineKeyboardButton(cat[1], callback_data=f"cat_{cat[0]}"))
+    markup.add(InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
+    return markup
+
+
+def subcategories_menu(parent_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    subs = get_categories(parent_id)
+    if subs:
+        for sub in subs:
+            markup.add(InlineKeyboardButton(sub[1], callback_data=f"sub_{sub[0]}"))
+    else:
+        return products_menu(parent_id)
+    markup.add(InlineKeyboardButton("🔙 Назад", callback_data="back_catalog"))
+    return markup
+
+
+def products_menu(subcategory_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    products = get_products_by_subcategory(subcategory_id)
+    for prod in products:
+        markup.add(InlineKeyboardButton(prod[1], callback_data=f"product_{prod[0]}"))
+    markup.add(InlineKeyboardButton("🔙 Назад", callback_data="back_sub"))
+    return markup
+
+
+def product_detail_menu(product_id):
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("🛒 Купить", callback_data=f"buy_{product_id}"),
+        InlineKeyboardButton("🔙 Назад", callback_data="back_products")
+    )
+    return markup
+
+
+def payment_methods_menu(product_id):
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("💰 Купить с баланса", callback_data=f"pay_balance_{product_id}"),
+        InlineKeyboardButton("🔙 Назад", callback_data=f"product_{product_id}")
+    )
+    return markup
+
+
+# ===== КОМАНДЫ =====
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = message.from_user.id
+    username = message.from_user.username or "Нет"
+    first_name = message.from_user.first_name or "Пользователь"
+
+    create_user(user_id, username, first_name)
+
+    if len(message.text.split()) > 1:
+        ref_id = message.text.split()[1]
+        if ref_id.isdigit() and int(ref_id) != user_id:
+            conn = sqlite3.connect('shop.db')
+            c = conn.cursor()
+            c.execute("UPDATE users SET ref_count = ref_count + 1 WHERE id=?", (int(ref_id),))
+            conn.commit()
+            conn.close()
+            try:
+                bot.send_message(int(ref_id), f"🎉 По вашей реферальной ссылке зарегистрировался {first_name}!")
+            except:
+                pass
+
+    welcome_msg = get_setting('welcome_msg')
+    bot.send_message(user_id, welcome_msg, reply_markup=main_menu())
+
+
+@bot.message_handler(commands=['admin'])
+def admin_panel(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "⛔ У вас нет доступа к админ-панели")
+        return
+    show_admin_menu(message.chat.id)
+
+
+@bot.message_handler(commands=['order'])
+def get_order_by_command(message):
+    user_id = message.from_user.id
+    parts = message.text.split()
+
+    if len(parts) < 2:
+        bot.reply_to(message, "❌ Используйте: /order НОМЕР_ЗАКАЗА")
+        return
+
+    order_num = parts[1].upper()
+    order = get_order_by_num(order_num)
+
+    if not order:
+        bot.reply_to(message, f"❌ Заказ {order_num} не найден")
+        return
+
+    if order[2] != user_id and user_id not in ADMIN_IDS:
+        bot.reply_to(message, "⛔ Это не ваш заказ")
+        return
+
+    show_order_info(user_id, order)
+
+
+@bot.message_handler(commands=['getcode'])
+def get_code_command(message):
+    user_id = message.from_user.id
+    parts = message.text.split()
+
+    if len(parts) < 2:
+        bot.reply_to(message, "❌ Используйте: /getcode НОМЕР_ЗАКАЗА")
+        return
+
+    order_num = parts[1].upper()
+    order = get_order_by_num(order_num)
+
+    if not order:
+        bot.reply_to(message, f"❌ Заказ {order_num} не найден")
+        return
+
+    if order[2] != user_id:
+        bot.reply_to(message, "⛔ Это не ваш заказ")
+        return
+
+    if not order[10]:
+        bot.reply_to(message, "❌ Для этого заказа нет кода")
+        return
+
+    if order[5] == 'completed':
+        bot.reply_to(message, "✅ Заказ уже выполнен. Код должен быть у вас.")
+        return
+
+    class MockCall:
+        def __init__(self, user_id, order_num, message):
+            self.from_user = type('obj', (object,), {'id': user_id, 'first_name': message.from_user.first_name,
+                                                     'username': message.from_user.username})
+            self.id = f"mock_{order_num}"
+            self.data = f"get_code_order_{order_num}"
+            self.message = message
+
+    mock_call = MockCall(user_id, order_num, message)
+    get_code_request(mock_call)
+
+
+# ===== ОБРАБОТЧИКИ КНОПОК =====
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    user_id = call.from_user.id
+    data = call.data
+
+    if data == "back_main":
+        bot.edit_message_text(get_setting('welcome_msg'), user_id, call.message.message_id, reply_markup=main_menu())
+
+    elif data == "catalog":
+        bot.edit_message_text("📦 <b>Выберите категорию</b>", user_id, call.message.message_id,
+                              reply_markup=catalog_menu(), parse_mode="HTML")
+
+    elif data.startswith("cat_"):
+        cat_id = int(data.split("_")[1])
+        subs = get_categories(cat_id)
+        if subs:
+            bot.edit_message_text("📂 <b>Выберите подкатегорию</b>", user_id, call.message.message_id,
+                                  reply_markup=subcategories_menu(cat_id), parse_mode="HTML")
+        else:
+            bot.edit_message_text("📦 <b>Товары в категории</b>", user_id, call.message.message_id,
+                                  reply_markup=products_menu(cat_id), parse_mode="HTML")
+
+    elif data.startswith("sub_"):
+        sub_id = int(data.split("_")[1])
+        products = get_products_by_subcategory(sub_id)
+        if products:
+            bot.edit_message_text("🛍 <b>Выберите товар</b>", user_id, call.message.message_id,
+                                  reply_markup=products_menu(sub_id), parse_mode="HTML")
+        else:
+            bot.answer_callback_query(call.id, "В этой категории пока нет товаров")
+
+    elif data == "back_catalog":
+        bot.edit_message_text("📦 <b>Выберите категорию</b>", user_id, call.message.message_id,
+                              reply_markup=catalog_menu(), parse_mode="HTML")
+
+    elif data == "back_sub":
+        bot.edit_message_text("📂 <b>Выберите подкатегорию</b>", user_id, call.message.message_id,
+                              reply_markup=subcategories_menu(0), parse_mode="HTML")
+
+    elif data == "back_products":
+        bot.edit_message_text("🛍 <b>Выберите товар</b>", user_id, call.message.message_id,
+                              reply_markup=products_menu(0), parse_mode="HTML")
+
+    elif data.startswith("product_"):
+        prod_id = int(data.split("_")[1])
+        prod = get_product(prod_id)
+        if prod:
+            discount = 0
+            conn = sqlite3.connect('shop.db')
+            c = conn.cursor()
+            c.execute("SELECT discount_type, discount_value, product_id FROM user_discount WHERE user_id=?", (user_id,))
+            disc_data = c.fetchone()
+            conn.close()
+
+            if disc_data:
+                disc_type, disc_value, disc_prod_id = disc_data
+                if disc_type == 'all':
+                    discount = disc_value
+                elif disc_type == 'category' and prod[4] == disc_prod_id:
+                    discount = disc_value
+                elif disc_type == 'product' and prod[0] == disc_prod_id:
+                    discount = disc_value
+
+            final_price = prod[3] * (100 - discount) / 100 if discount else prod[3]
+
+            text = f"📌 <b>{prod[1]}</b>\n\n{prod[2]}\n\n💰 Цена: {prod[3]}₽"
+            if discount:
+                text += f"\n🎉 Скидка: {discount}%\n💵 Итоговая цена: {final_price}₽"
+
+            bot.edit_message_text(text, user_id, call.message.message_id,
+                                  reply_markup=product_detail_menu(prod_id), parse_mode="HTML")
+
+    elif data.startswith("buy_"):
+        prod_id = int(data.split("_")[1])
+        bot.edit_message_text("💳 <b>Выберите способ оплаты</b>", user_id, call.message.message_id,
+                              reply_markup=payment_methods_menu(prod_id), parse_mode="HTML")
+
+    elif data.startswith("pay_balance_"):
+        prod_id = int(data.split("_")[2])
+        buy_with_balance(user_id, prod_id, call)
+
+    elif data == "balance":
+        balance = get_balance(user_id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("💳 Пополнить", callback_data="deposit"),
+            InlineKeyboardButton("📊 История", callback_data="balance_history"),
+            InlineKeyboardButton("🔙 Назад", callback_data="back_main")
+        )
+        bot.edit_message_text(f"💰 <b>Ваш баланс:</b> {balance}₽", user_id, call.message.message_id,
+                              reply_markup=markup, parse_mode="HTML")
+
+    elif data == "balance_history":
+        orders = get_user_orders(user_id, 20)
+        if not orders:
+            text = "📊 <b>История операций</b>\n\nНет операций"
+        else:
+            text = "📊 <b>Последние операции</b>\n\n"
+            for order in orders:
+                status_emoji = "✅" if order[3] == "completed" else "🟡" if order[3] == "new" else "❌"
+                text += f"{status_emoji} {order[0]} | {order[1]} | {order[2]}₽\n"
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("🔙 Назад", callback_data="balance"))
+        bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data == "deposit":
+        bot.edit_message_text("💳 <b>Пополнение баланса</b>\n\nВведите сумму пополнения (от 10₽):",
+                              user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_deposit)
+
+    elif data == "profile":
+        user = get_user(user_id)
+        if user:
+            text = f"👤 <b>Профиль</b>\n\nИмя: {user[2]}\nUsername: @{user[1] if user[1] != 'Нет' else 'Нет'}\nID: {user[0]}\nБаланс: {user[3]}₽\n\n🔗 Реферальная ссылка: {user[4]}\n👥 Приглашено: {user[5]}"
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
+            bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data == "my_orders":
+        orders = get_user_orders(user_id, 10)
+        if not orders:
+            text = "📋 <b>Мои заказы</b>\n\nУ вас пока нет заказов"
+        else:
+            text = "📋 <b>Мои заказы (последние 10)</b>\n\n"
+            for order in orders:
+                status_emoji = "✅" if order[3] == "completed" else "🟡" if order[3] == "new" else "🟠" if order[
+                                                                                                            3] == "pending" else "❌"
+                text += f"{status_emoji} <b>{order[0]}</b> - {order[1]} ({order[2]}₽)\n"
+            text += "\nНажмите на номер заказа для подробной информации"
+
+        markup = InlineKeyboardMarkup(row_width=2)
+        for order in orders[:5]:
+            markup.add(InlineKeyboardButton(f"📋 {order[0]}", callback_data=f"view_order_{order[0]}"))
+        markup.add(InlineKeyboardButton("🔙 На главную", callback_data="back_main"))
+        bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data.startswith("view_order_"):
+        order_num = data.split("_")[2]
+        order = get_order_by_num(order_num)
+        if order:
+            show_order_info(user_id, order)
+        else:
+            bot.answer_callback_query(call.id, "Заказ не найден")
+
+    elif data.startswith("refresh_order_"):
+        order_num = data.split("_")[2]
+        order = get_order_by_num(order_num)
+        if order:
+            show_order_info(user_id, order)
+        else:
+            bot.answer_callback_query(call.id, "Заказ не найден")
+
+    elif data == "bonuses":
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("🎫 Ввести промокод", callback_data="enter_promo"),
+            InlineKeyboardButton("🔙 Назад", callback_data="back_main")
+        )
+        bonus_enabled = get_setting('bonus_enabled')
+        bonus_percent = get_setting('bonus_percent')
+        text = f"🎁 <b>Бонусы</b>\n\n"
+        if bonus_enabled == '1':
+            text += f"✅ Приветственный бонус: {bonus_percent}% скидка на первый заказ с баланса\n"
+        else:
+            text += "❌ Приветственный бонус временно отключен\n"
+        text += "\nВводите промокоды и получайте призы!"
+        bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data == "enter_promo":
+        bot.edit_message_text("🎫 <b>Введите промокод</b>", user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_promocode)
+
+    elif data == "support":
+        support_id = get_setting('support_id')
+        text = f"🆘 <b>Поддержка</b>\n\nСвяжитесь с нами: @PrimeRbxStore\n\n📌 Для быстрого решения проблемы пришлите номер заказа."
+        bot.edit_message_text(text, user_id, call.message.message_id, parse_mode="HTML")
+
+    elif data == "admin":
+        if user_id not in ADMIN_IDS:
+            bot.answer_callback_query(call.id, "⛔ Доступ запрещен")
+            return
+        show_admin_menu(user_id)
+
+    elif data.startswith("admin_"):
+        handle_admin_actions(call)
+
+    elif data.startswith("get_code_order_"):
+        get_code_request(call)
+
+    elif data.startswith("admin_send_code_"):
+        admin_send_code(call)
+
+
+# ===== ЗАПРОС КОДА =====
+def get_code_request(call):
+    order_num = call.data.split("_")[3]
+    user_id = call.from_user.id
+
+    order = get_order_by_num(order_num)
+    if not order:
+        bot.answer_callback_query(call.id, "❌ Заказ не найден")
+        return
+
+    if order[2] != user_id and user_id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "⛔ Это не ваш заказ")
+        return
+
+    if not order[10]:
+        bot.answer_callback_query(call.id, "❌ Код для этого заказа не найден")
+        return
+
+    if order[5] == 'completed':
+        bot.answer_callback_query(call.id, "✅ Заказ уже выполнен. Код должен быть у вас.")
+        return
+
+    support_id = get_setting('support_id')
+
+    user_name = call.from_user.first_name or "Пользователь"
+    user_username = call.from_user.username or "Нет"
+
+    support_message = (
+        f"🔑 <b>ЗАПРОС КОДА</b>\n\n"
+        f"👤 <b>Пользователь:</b> {user_name}\n"
+        f"🆔 <b>Telegram ID:</b> {user_id}\n"
+        f"👤 <b>Username:</b> @{user_username}\n"
+        f"🆔 <b>Номер заказа:</b> <code>{order_num}</code>\n"
+        f"📦 <b>Товар:</b> {order[4]}\n"
+        f"💰 <b>Сумма:</b> {order[7]}₽\n"
+        f"📅 <b>Дата заказа:</b> {order[6][:16]}\n\n"
+        f"📌 <b>Сообщение пользователя:</b>\n"
+        f"Здравствуйте! Прошу предоставить код для заказа {order_num}."
+    )
+
+    try:
+        if support_id.isdigit():
+            support_id_int = int(support_id)
+            bot.send_message(support_id_int, support_message, parse_mode="HTML")
+
+            admin_markup = InlineKeyboardMarkup(row_width=2)
+            admin_markup.add(
+                InlineKeyboardButton("✅ Отправить код", callback_data=f"admin_send_code_{order_num}"),
+                InlineKeyboardButton("📋 Просмотр заказа", callback_data=f"view_order_{order_num}")
+            )
+            bot.send_message(support_id_int, "🔽 <b>Действия:</b>", reply_markup=admin_markup, parse_mode="HTML")
+
+        for admin_id in ADMIN_IDS:
+            if str(admin_id) != support_id:
+                try:
+                    bot.send_message(admin_id,
+                                     f"🔑 <b>Запрос кода</b>\n\nЗаказ: <code>{order_num}</code>\nПользователь: {user_id}",
+                                     parse_mode="HTML")
+                except:
+                    pass
+
+        bot.answer_callback_query(call.id, "✅ Ваш запрос отправлен в поддержку!")
+
+        user_markup = InlineKeyboardMarkup(row_width=1)
+        user_markup.add(
+            InlineKeyboardButton("📋 Мои заказы", callback_data="my_orders"),
+            InlineKeyboardButton("🔙 На главную", callback_data="back_main")
+        )
+
+        bot.edit_message_text(
+            f"✅ <b>Запрос кода отправлен!</b>\n\n"
+            f"🆔 Заказ: <code>{order_num}</code>\n\n"
+            f"📩 Ожидайте ответ от поддержки.\n"
+            f"Код придет в этот чат в ближайшее время.\n\n"
+            f"💬 Если у вас есть вопросы, обратитесь в поддержку: @{support_id}",
+            user_id,
+            call.message.message_id,
+            parse_mode="HTML",
+            reply_markup=user_markup
+        )
+
+    except Exception as e:
+        bot.answer_callback_query(call.id, "❌ Ошибка отправки запроса. Попробуйте позже.")
+        print(f"Error sending support message: {e}")
+
+
+# ===== АДМИН ОТПРАВЛЯЕТ КОД =====
+def admin_send_code(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "⛔ Доступ запрещен")
+        return
+
+    order_num = call.data.split("_")[3]
+    order = get_order_by_num(order_num)
+
+    if not order:
+        bot.answer_callback_query(call.id, "❌ Заказ не найден")
+        return
+
+    user_id = order[2]
+    code_data = order[10]
+
+    if not code_data:
+        bot.answer_callback_query(call.id, "❌ У заказа нет кода")
+        return
+
+    try:
+        text = (
+            f"🔑 <b>Код для заказа</b> <code>{order_num}</code>\n\n"
+            f"📦 <b>Товар:</b> {order[4]}\n\n"
+            f"<b>Ваш код:</b>\n"
+            f"<code>{code_data}</code>\n\n"
+            f"✅ Введите этот код для доступа к товару.\n"
+            f"Если код не подходит, обратитесь в поддержку."
+        )
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("📋 Мои заказы", callback_data="my_orders"),
+            InlineKeyboardButton("🆘 Поддержка", callback_data="support")
+        )
+
+        bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+
+        update_order_status(order_num, 'completed', 'Код отправлен пользователю')
+
+        bot.answer_callback_query(call.id, "✅ Код отправлен пользователю!")
+        bot.edit_message_text(
+            f"✅ Код для заказа {order_num} отправлен пользователю",
+            call.from_user.id,
+            call.message.message_id,
+            reply_markup=main_menu()
+        )
+
+        bot.send_message(call.from_user.id, f"📝 Вы отправили код для заказа {order_num}")
+
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ Ошибка: {str(e)}")
+
+
+# ===== ПОКАЗ ИНФОРМАЦИИ О ЗАКАЗЕ =====
+def show_order_info(user_id, order):
+    order_id, order_num, user_id_db, product_id, product_name, status, created_at, amount, payment_type, delivery_data, code_data, completed_at, admin_comment = order
+
+    status_emoji = {
+        'new': '🟡 Новый',
+        'pending': '🟠 Ожидает оплаты',
+        'completed': '✅ Выполнен',
+        'cancelled': '❌ Отменён',
+        'delivered': '📦 Доставлен'
+    }.get(status, '❓ Неизвестно')
+
+    text = f"📋 <b>Информация о заказе</b>\n\n"
+    text += f"🔢 <b>Номер:</b> <code>{order_num}</code>\n"
+    text += f"📦 <b>Товар:</b> {product_name}\n"
+    text += f"💰 <b>Сумма:</b> {amount}₽\n"
+    text += f"💳 <b>Оплата:</b> {payment_type}\n"
+    text += f"📊 <b>Статус:</b> {status_emoji}\n"
+    text += f"📅 <b>Создан:</b> {created_at[:16]}\n"
+
+    if completed_at:
+        text += f"✅ <b>Выполнен:</b> {completed_at[:16]}\n"
+
+    if admin_comment:
+        text += f"💬 <b>Комментарий админа:</b> {admin_comment}\n"
+
+    if delivery_data:
+        text += f"\n📦 <b>Данные для доступа:</b>\n{delivery_data}\n"
+
+    if code_data:
+        text += f"\n🔑 <b>Код для входа:</b>\n<code>{code_data}</code>\n"
+
+    markup = InlineKeyboardMarkup(row_width=2)
+
+    if user_id in ADMIN_IDS and status in ['new', 'pending']:
+        markup.add(
+            InlineKeyboardButton("✅ Выполнить", callback_data=f"admin_complete_order_{order_num}"),
+            InlineKeyboardButton("❌ Отменить", callback_data=f"admin_cancel_order_{order_num}")
+        )
+        markup.add(InlineKeyboardButton("✏️ Добавить данные", callback_data=f"admin_add_data_{order_num}"))
+
+    if code_data and status not in ['completed', 'delivered', 'cancelled']:
+        if user_id in ADMIN_IDS:
+            markup.add(
+                InlineKeyboardButton("📨 Отправить код пользователю", callback_data=f"admin_send_code_{order_num}"))
+        else:
+            markup.add(InlineKeyboardButton("🔑 Запросить код", callback_data=f"get_code_order_{order_num}"))
+
+    markup.add(InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_order_{order_num}"))
+    markup.add(InlineKeyboardButton("🔙 На главную", callback_data="back_main"))
+
+    bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+
+
+# ===== ПОКАЗ АДМИН-МЕНЮ =====
+def show_admin_menu(chat_id):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
+        InlineKeyboardButton("📦 Товары", callback_data="admin_products"),
+        InlineKeyboardButton("📂 Категории", callback_data="admin_categories"),
+        InlineKeyboardButton("📋 Заказы", callback_data="admin_orders"),
+        InlineKeyboardButton("💰 Балансы", callback_data="admin_balances"),
+        InlineKeyboardButton("🎫 Промокоды", callback_data="admin_promocodes"),
+        InlineKeyboardButton("🔔 Уведомления", callback_data="admin_notify"),
+        InlineKeyboardButton("📨 Рассылка", callback_data="admin_mailing"),
+        InlineKeyboardButton("💬 Приветствие", callback_data="admin_welcome"),
+        InlineKeyboardButton("🎁 Бонусы", callback_data="admin_bonus"),
+        InlineKeyboardButton("🔢 Префикс заказов", callback_data="admin_order_prefix"),
+        InlineKeyboardButton("🔙 На главную", callback_data="back_main")
+    )
+    bot.send_message(chat_id, "⚙️ <b>Админ-панель</b>", reply_markup=markup, parse_mode="HTML")
+
+
+# ===== ПОКУПКА С БАЛАНСА =====
+def buy_with_balance(user_id, product_id, call):
+    prod = get_product(product_id)
+    if not prod:
+        bot.answer_callback_query(call.id, "Товар не найден")
+        return
+
+    balance = get_balance(user_id)
+    price = prod[3]
+
+    discount = 0
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT discount_type, discount_value, product_id FROM user_discount WHERE user_id=?", (user_id,))
+    disc_data = c.fetchone()
+    conn.close()
+
+    if disc_data:
+        disc_type, disc_value, disc_prod_id = disc_data
+        if disc_type == 'all':
+            discount = disc_value
+        elif disc_type == 'category' and prod[4] == disc_prod_id:
+            discount = disc_value
+        elif disc_type == 'product' and prod[0] == disc_prod_id:
+            discount = disc_value
+
+    final_price = price * (100 - discount) / 100 if discount else price
+
+    if balance < final_price:
+        bot.answer_callback_query(call.id, f"❌ Недостаточно средств! Нужно: {final_price}₽")
+        return
+
+    add_balance(user_id, -final_price)
+
+    order_id, order_num = create_order(user_id, product_id, prod[1], final_price, 'Баланс',
+                                       prod[6] if prod[5] == 1 else '',
+                                       prod[8] if prod[7] == 1 else '')
+
+    update_order_status(order_num, 'completed')
+
+    if prod[5] == 1 and prod[6]:
+        if prod[7] == 1:
+            text = (
+                f"✅ <b>Оплата прошла успешно!</b>\n\n"
+                f"🆔 Заказ: <code>{order_num}</code>\n\n"
+                f"📦 <b>Товар:</b> {prod[1]}\n\n"
+                f"🔐 <b>Для получения товара требуется код</b>\n\n"
+                f"Нажмите кнопку ниже, чтобы запросить код у поддержки:"
+            )
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                InlineKeyboardButton("🔑 Запросить код", callback_data=f"get_code_order_{order_num}"),
+                InlineKeyboardButton("📋 Мои заказы", callback_data="my_orders"),
+                InlineKeyboardButton("🔙 На главную", callback_data="back_main")
+            )
+        else:
+            text = f"✅ <b>Оплата прошла успешно!</b>\n\n🆔 Заказ: <code>{order_num}</code>\n\n📦 <b>Товар:</b> {prod[1]}\n\n📦 <b>Данные для доступа:</b>\n\n{prod[6]}"
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                InlineKeyboardButton("📋 Мои заказы", callback_data="my_orders"),
+                InlineKeyboardButton("🔙 На главную", callback_data="back_main")
+            )
+
+        bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+    else:
+        text = f"✅ <b>Оплата прошла успешно!</b>\n\n🆔 Заказ: <code>{order_num}</code>\n\n📦 <b>Товар:</b> {prod[1]}\n\n⏳ Товар будет выдан администратором."
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("📋 Мои заказы", callback_data="my_orders"),
+            InlineKeyboardButton("🔙 На главную", callback_data="back_main")
+        )
+        bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+
+    if get_setting('notify_enabled') == '1':
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.send_message(admin_id,
+                                 f"🆕 <b>Новый заказ!</b>\n\n🆔 <code>{order_num}</code>\n👤 Пользователь: {user_id}\n📦 Товар: {prod[1]}\n💰 Сумма: {final_price}₽\n💳 Оплата: Баланс",
+                                 parse_mode="HTML")
+            except:
+                pass
+
+    bot.answer_callback_query(call.id, "✅ Оплата прошла успешно!")
+    bot.edit_message_text(f"✅ Заказ <code>{order_num}</code> оформлен!", user_id, call.message.message_id,
+                          reply_markup=main_menu(), parse_mode="HTML")
+
+
+# ===== ПОПОЛНЕНИЕ БАЛАНСА =====
+def process_deposit(message):
+    user_id = message.from_user.id
+    try:
+        amount = float(message.text.replace(',', '.'))
+        if amount < 10:
+            bot.send_message(user_id, "❌ Минимальная сумма пополнения: 10₽")
+            return
+    except:
+        bot.send_message(user_id, "❌ Введите число")
+        return
+
+    # Просто начисляем баланс (без платежной системы)
+    add_balance(user_id, amount)
+    bot.send_message(user_id, f"✅ Баланс пополнен на {amount}₽", reply_markup=main_menu())
+
+
+def process_promocode(message):
+    user_id = message.from_user.id
+    code = message.text.strip()
+
+    success, msg = apply_promocode(user_id, code)
+
+    if success:
+        bot.send_message(user_id, f"✅ {msg}", reply_markup=main_menu())
+    else:
+        bot.send_message(user_id, f"❌ {msg}", reply_markup=main_menu())
+
+
+# ===== ADMIN ACTIONS =====
+def handle_admin_actions(call):
+    user_id = call.from_user.id
+    data = call.data
+
+    if data == "admin_stats":
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        users_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM orders WHERE status='new' OR status='pending'")
+        new_orders = c.fetchone()[0]
+        c.execute("SELECT SUM(amount) FROM orders WHERE status='completed'")
+        total_income = c.fetchone()[0] or 0
+        c.execute("SELECT COUNT(*) FROM orders WHERE status='completed' AND date(completed_at)=date('now')")
+        today_orders = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM orders WHERE status='completed'")
+        total_orders = c.fetchone()[0]
+        conn.close()
+
+        text = f"📊 <b>Статистика</b>\n\n👥 Пользователей: {users_count}\n📦 Новых заказов: {new_orders}\n✅ Выполнено сегодня: {today_orders}\n📋 Всего выполнено: {total_orders}\n💰 Доход: {total_income}₽"
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("🔙 Назад", callback_data="admin"))
+        bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_orders":
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("""SELECT order_num, user_id, product_name, amount, status, created_at 
+                     FROM orders ORDER BY id DESC LIMIT 20""")
+        orders = c.fetchall()
+        conn.close()
+
+        if not orders:
+            text = "📋 <b>Заказы</b>\n\nНет заказов"
+        else:
+            text = "📋 <b>Последние заказы</b>\n\n"
+            for order in orders:
+                status_emoji = "✅" if order[4] == "completed" else "🟡" if order[4] == "new" else "🟠" if order[
+                                                                                                            4] == "pending" else "❌"
+                text += f"{status_emoji} <b>{order[0]}</b> | {order[2]} | {order[3]}₽ | {order[5][:10]}\n"
+
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📋 Все заказы", callback_data="admin_all_orders"),
+            InlineKeyboardButton("🆕 Новые", callback_data="admin_new_orders"),
+            InlineKeyboardButton("🔍 Поиск по номеру", callback_data="admin_search_order"),
+            InlineKeyboardButton("🔙 Назад", callback_data="admin")
+        )
+        bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_all_orders":
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("""SELECT order_num, user_id, product_name, amount, status, created_at 
+                     FROM orders ORDER BY id DESC LIMIT 50""")
+        orders = c.fetchall()
+        conn.close()
+
+        if not orders:
+            text = "📋 <b>Все заказы</b>\n\nНет заказов"
+        else:
+            text = "📋 <b>Все заказы (последние 50)</b>\n\n"
+            for order in orders:
+                status_emoji = "✅" if order[4] == "completed" else "🟡" if order[4] == "new" else "🟠" if order[
+                                                                                                            4] == "pending" else "❌"
+                text += f"{status_emoji} <b>{order[0]}</b> | {order[2]} | {order[3]}₽ | {order[5][:10]}\n"
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_orders"))
+        bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_new_orders":
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("""SELECT order_num, user_id, product_name, amount, created_at 
+                     FROM orders WHERE status='new' OR status='pending'
+                     ORDER BY id DESC""")
+        orders = c.fetchall()
+        conn.close()
+
+        if not orders:
+            text = "🆕 <b>Новые заказы</b>\n\nНет новых заказов"
+        else:
+            text = "🆕 <b>Новые заказы</b>\n\n"
+            for order in orders:
+                text += f"🟡 <b>{order[0]}</b> | {order[2]} | {order[3]}₽ | {order[4][:10]}\n"
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_orders"))
+        bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_search_order":
+        bot.edit_message_text("🔍 <b>Поиск заказа</b>\n\nВведите номер заказа:",
+                              user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_search_order)
+
+    elif data.startswith("admin_complete_order_"):
+        order_num = data.split("_")[3]
+        order = get_order_by_num(order_num)
+        if order:
+            update_order_status(order_num, 'completed', 'Выполнен администратором')
+            bot.answer_callback_query(call.id, f"✅ Заказ {order_num} выполнен")
+            try:
+                bot.send_message(order[2], f"✅ Ваш заказ {order_num} выполнен!\n\nТовар: {order[4]}")
+            except:
+                pass
+            show_order_info(user_id, order)
+        else:
+            bot.answer_callback_query(call.id, "Заказ не найден")
+
+    elif data.startswith("admin_cancel_order_"):
+        order_num = data.split("_")[3]
+        order = get_order_by_num(order_num)
+        if order:
+            if order[7] > 0 and order[5] in ['new', 'pending']:
+                add_balance(order[2], order[7])
+            update_order_status(order_num, 'cancelled', 'Отменён администратором')
+            bot.answer_callback_query(call.id, f"❌ Заказ {order_num} отменён")
+            try:
+                bot.send_message(order[2], f"❌ Ваш заказ {order_num} отменён.\nДеньги возвращены на баланс.")
+            except:
+                pass
+            show_order_info(user_id, order)
+        else:
+            bot.answer_callback_query(call.id, "Заказ не найден")
+
+    elif data.startswith("admin_add_data_"):
+        order_num = data.split("_")[3]
+        bot.edit_message_text(
+            f"✏️ <b>Добавление данных для заказа {order_num}</b>\n\nВведите данные для выдачи (логин:пароль или ссылка):",
+            user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, lambda msg: process_add_order_data(msg, order_num))
+
+    elif data == "admin_products":
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("➕ Добавить товар", callback_data="admin_add_product"),
+            InlineKeyboardButton("🗑 Удалить товар", callback_data="admin_del_product"),
+            InlineKeyboardButton("📋 Список товаров", callback_data="admin_list_products"),
+            InlineKeyboardButton("🔙 Назад", callback_data="admin")
+        )
+        bot.edit_message_text("📦 <b>Управление товарами</b>", user_id, call.message.message_id,
+                              reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_list_products":
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("SELECT id, name, price, category_id FROM products ORDER BY name")
+        products = c.fetchall()
+        conn.close()
+
+        if not products:
+            text = "📋 <b>Список товаров</b>\n\nНет товаров"
+        else:
+            text = "📋 <b>Список товаров</b>\n\n"
+            for prod in products:
+                text += f"🆔 {prod[0]} | {prod[1]} | {prod[2]}₽ | Категория: {prod[3]}\n"
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_products"))
+        bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_categories":
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("➕ Добавить категорию", callback_data="admin_add_cat"),
+            InlineKeyboardButton("📂 Добавить подкатегорию", callback_data="admin_add_subcat"),
+            InlineKeyboardButton("🗑 Удалить категорию", callback_data="admin_del_cat"),
+            InlineKeyboardButton("📋 Список категорий", callback_data="admin_list_cats"),
+            InlineKeyboardButton("🔙 Назад", callback_data="admin")
+        )
+        bot.edit_message_text("📂 <b>Управление категориями</b>", user_id, call.message.message_id,
+                              reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_list_cats":
+        categories = get_categories(0)
+        if not categories:
+            text = "📋 <b>Список категорий</b>\n\nНет категорий"
+        else:
+            text = "📋 <b>Список категорий</b>\n\n"
+            for cat in categories:
+                text += f"📁 {cat[1]} (ID: {cat[0]})\n"
+                subs = get_categories(cat[0])
+                for sub in subs:
+                    text += f"  └─ 📂 {sub[1]} (ID: {sub[0]})\n"
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_categories"))
+        bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_balances":
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("➕ Пополнить баланс", callback_data="admin_add_balance"),
+            InlineKeyboardButton("➖ Списать баланс", callback_data="admin_sub_balance"),
+            InlineKeyboardButton("🔍 Проверить баланс", callback_data="admin_check_balance"),
+            InlineKeyboardButton("🔙 Назад", callback_data="admin")
+        )
+        bot.edit_message_text("💰 <b>Управление балансами</b>", user_id, call.message.message_id,
+                              reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_check_balance":
+        bot.edit_message_text("🔍 <b>Проверка баланса</b>\n\nВведите ID пользователя:",
+                              user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_check_balance)
+
+    elif data == "admin_promocodes":
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("➕ Создать промокод", callback_data="admin_create_promo"),
+            InlineKeyboardButton("🗑 Удалить промокод", callback_data="admin_del_promo"),
+            InlineKeyboardButton("📋 Список", callback_data="admin_list_promo"),
+            InlineKeyboardButton("🔙 Назад", callback_data="admin")
+        )
+        bot.edit_message_text("🎫 <b>Управление промокодами</b>", user_id, call.message.message_id,
+                              reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_notify":
+        current = get_setting('notify_enabled')
+        status = "🔔 Включены" if current == '1' else "🔕 Выключены"
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("📢 Включить" if current == '0' else "🔇 Выключить",
+                                 callback_data="admin_toggle_notify"),
+            InlineKeyboardButton("🔙 Назад", callback_data="admin")
+        )
+        bot.edit_message_text(f"<b>Уведомления о заказах</b>\n\nТекущий статус: {status}",
+                              user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_toggle_notify":
+        current = get_setting('notify_enabled')
+        new_val = '0' if current == '1' else '1'
+        set_setting('notify_enabled', new_val)
+        bot.answer_callback_query(call.id, f"Уведомления {'включены' if new_val == '1' else 'выключены'}")
+        handle_admin_actions(call)
+
+    elif data == "admin_mailing":
+        bot.edit_message_text("📨 <b>Рассылка</b>\n\nВведите текст для рассылки (можно с HTML-разметкой):",
+                              user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_mailing)
+
+    elif data == "admin_welcome":
+        bot.edit_message_text("💬 <b>Изменить приветствие</b>\n\nВведите новый текст приветствия:",
+                              user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_welcome_change)
+
+    elif data == "admin_bonus":
+        current = get_setting('bonus_enabled')
+        percent = get_setting('bonus_percent')
+        status = "✅ Включен" if current == '1' else "❌ Отключен"
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🔀 Переключить" if current == '1' else "🔀 Включить",
+                                 callback_data="admin_toggle_bonus"),
+            InlineKeyboardButton("✏️ Изменить %", callback_data="admin_edit_bonus"),
+            InlineKeyboardButton("🔙 Назад", callback_data="admin")
+        )
+        bot.edit_message_text(f"🎁 <b>Управление бонусами</b>\n\nСтатус: {status}\nРазмер: {percent}%",
+                              user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data == "admin_toggle_bonus":
+        current = get_setting('bonus_enabled')
+        set_setting('bonus_enabled', '0' if current == '1' else '1')
+        bot.answer_callback_query(call.id, "Бонусы переключены")
+        handle_admin_actions(call)
+
+    elif data == "admin_edit_bonus":
+        bot.edit_message_text("🎁 <b>Введите новый размер бонуса (число от 1 до 100):</b>",
+                              user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_bonus_change)
+
+    elif data == "admin_order_prefix":
+        current = get_setting('order_prefix')
+        bot.edit_message_text(
+            f"🔢 <b>Префикс номеров заказов</b>\n\nТекущий префикс: {current}\n\nВведите новый префикс (например: SHOP, STORE и т.д.):",
+            user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_order_prefix_change)
+
+    elif data == "admin_add_product":
+        bot.edit_message_text("➕ <b>Добавление товара</b>\n\nВведите название товара:",
+                              user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_add_product_name)
+
+    elif data == "admin_del_product":
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("SELECT id, name FROM products ORDER BY name")
+        products = c.fetchall()
+        conn.close()
+
+        if not products:
+            bot.answer_callback_query(call.id, "Нет товаров для удаления")
+            return
+
+        markup = InlineKeyboardMarkup(row_width=2)
+        for prod in products:
+            markup.add(InlineKeyboardButton(f"❌ {prod[1]}", callback_data=f"admin_del_product_confirm_{prod[0]}"))
+        markup.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_products"))
+        bot.edit_message_text("🗑 <b>Выберите товар для удаления</b>", user_id, call.message.message_id,
+                              reply_markup=markup, parse_mode="HTML")
+
+    elif data.startswith("admin_del_product_confirm_"):
+        prod_id = int(data.split("_")[4])
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM products WHERE id=?", (prod_id,))
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, "✅ Товар удален")
+        bot.edit_message_text("✅ Товар удален", user_id, call.message.message_id, reply_markup=main_menu())
+
+    elif data == "admin_add_cat":
+        bot.edit_message_text("➕ <b>Добавление категории</b>\n\nВведите название категории:",
+                              user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_add_category)
+
+    elif data == "admin_add_subcat":
+        categories = get_categories(0)
+        if not categories:
+            bot.answer_callback_query(call.id, "Сначала создайте основную категорию")
+            return
+
+        markup = InlineKeyboardMarkup(row_width=2)
+        for cat in categories:
+            markup.add(InlineKeyboardButton(cat[1], callback_data=f"admin_select_parent_{cat[0]}"))
+        markup.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_categories"))
+        bot.edit_message_text("📂 <b>Выберите родительскую категорию для подкатегории</b>",
+                              user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+    elif data.startswith("admin_select_parent_"):
+        parent_id = int(data.split("_")[3])
+        bot.edit_message_text("➕ <b>Введите название подкатегории</b>", user_id, call.message.message_id,
+                              parse_mode="HTML")
+        bot.register_next_step_handler(call.message, lambda msg: process_add_subcategory(msg, parent_id))
+
+    elif data == "admin_del_cat":
+        categories = get_categories(0)
+        if not categories:
+            bot.answer_callback_query(call.id, "Нет категорий для удаления")
+            return
+
+        markup = InlineKeyboardMarkup(row_width=2)
+        for cat in categories:
+            markup.add(InlineKeyboardButton(f"❌ {cat[1]}", callback_data=f"admin_del_cat_confirm_{cat[0]}"))
+        markup.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_categories"))
+        bot.edit_message_text("🗑 <b>Выберите категорию для удаления</b>", user_id, call.message.message_id,
+                              reply_markup=markup, parse_mode="HTML")
+
+    elif data.startswith("admin_del_cat_confirm_"):
+        cat_id = int(data.split("_")[4])
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM categories WHERE id=? OR parent_id=?", (cat_id, cat_id))
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, "✅ Категория удалена")
+        bot.edit_message_text("✅ Категория удалена", user_id, call.message.message_id, reply_markup=main_menu())
+
+    elif data == "admin_add_balance":
+        bot.edit_message_text(
+            "➕ <b>Пополнение баланса</b>\n\nВведите ID пользователя и сумму через пробел (например: 123456789 100):",
+            user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_admin_add_balance)
+
+    elif data == "admin_sub_balance":
+        bot.edit_message_text(
+            "➖ <b>Списание баланса</b>\n\nВведите ID пользователя и сумму через пробел (например: 123456789 50):",
+            user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_admin_sub_balance)
+
+    elif data == "admin_create_promo":
+        bot.edit_message_text(
+            "🎫 <b>Создание промокода</b>\n\nВведите данные в формате:\n<code>код|тип|значение</code>\n\nТипы: balance, discount_all, discount_category, discount_product\n\nПримеры:\n<code>WELCOME10|balance|100</code> - 100₽ на баланс\n<code>SUMMER20|discount_all|20</code> - 20% скидка на всё",
+            user_id, call.message.message_id, parse_mode="HTML")
+        bot.register_next_step_handler(call.message, process_create_promo)
+
+    elif data == "admin_del_promo":
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("SELECT id, code FROM promocodes")
+        promos = c.fetchall()
+        conn.close()
+
+        if not promos:
+            bot.answer_callback_query(call.id, "Нет промокодов")
+            return
+
+        markup = InlineKeyboardMarkup(row_width=2)
+        for promo in promos:
+            markup.add(InlineKeyboardButton(f"❌ {promo[1]}", callback_data=f"admin_del_promo_confirm_{promo[0]}"))
+        markup.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_promocodes"))
+        bot.edit_message_text("🗑 <b>Выберите промокод для удаления</b>", user_id, call.message.message_id,
+                              reply_markup=markup, parse_mode="HTML")
+
+    elif data.startswith("admin_del_promo_confirm_"):
+        promo_id = int(data.split("_")[4])
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM promocodes WHERE id=?", (promo_id,))
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, "✅ Промокод удален")
+        bot.edit_message_text("✅ Промокод удален", user_id, call.message.message_id, reply_markup=main_menu())
+
+    elif data == "admin_list_promo":
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("SELECT code, discount_type, discount_value, uses, created_at FROM promocodes")
+        promos = c.fetchall()
+        conn.close()
+
+        if not promos:
+            text = "🎫 <b>Промокоды</b>\n\nНет промокодов"
+        else:
+            text = "🎫 <b>Список промокодов</b>\n\n"
+            for promo in promos:
+                text += f"📌 {promo[0]} | {promo[1]} | {promo[2]} | Использован: {promo[3]} | Создан: {promo[4][:10]}\n"
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_promocodes"))
+        bot.edit_message_text(text, user_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
+
+
+# ===== ОСТАЛЬНЫЕ ОБРАБОТЧИКИ =====
+def process_search_order(message):
+    user_id = message.from_user.id
+    order_num = message.text.strip().upper()
+
+    order = get_order_by_num(order_num)
+    if order:
+        show_order_info(user_id, order)
+    else:
+        bot.send_message(user_id, f"❌ Заказ {order_num} не найден", reply_markup=main_menu())
+
+
+def process_add_order_data(message, order_num):
+    user_id = message.from_user.id
+    data = message.text
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("UPDATE orders SET delivery_data=? WHERE order_num=?", (data, order_num))
+    conn.commit()
+    conn.close()
+
+    bot.send_message(user_id, f"✅ Данные для заказа {order_num} добавлены", reply_markup=main_menu())
+
+    order = get_order_by_num(order_num)
+    if order:
+        try:
+            bot.send_message(order[2], f"📦 К заказу {order_num} добавлены данные для доступа!\n\n{data}")
+        except:
+            pass
+
+
+def process_check_balance(message):
+    user_id = message.from_user.id
+    try:
+        target_id = int(message.text.strip())
+    except:
+        bot.send_message(user_id, "❌ Введите корректный ID")
+        return
+
+    balance = get_balance(target_id)
+    user = get_user(target_id)
+    if user:
+        bot.send_message(user_id, f"💰 Баланс пользователя {target_id}: {balance}₽", reply_markup=main_menu())
+    else:
+        bot.send_message(user_id, f"❌ Пользователь {target_id} не найден", reply_markup=main_menu())
+
+
+def process_order_prefix_change(message):
+    user_id = message.from_user.id
+    prefix = message.text.strip().upper()
+
+    if not prefix or not prefix.isalnum():
+        bot.send_message(user_id, "❌ Префикс должен содержать только буквы и цифры")
+        return
+
+    set_setting('order_prefix', prefix)
+    bot.send_message(user_id, f"✅ Префикс заказов изменен на {prefix}", reply_markup=main_menu())
+
+
+def process_mailing(message):
+    user_id = message.from_user.id
+    text = message.text
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT id FROM users")
+    users = c.fetchall()
+    conn.close()
+
+    sent = 0
+    for user in users:
+        try:
+            bot.send_message(user[0], text, parse_mode="HTML")
+            sent += 1
+            time.sleep(0.05)
+        except:
+            pass
+
+    bot.send_message(user_id, f"📨 Рассылка завершена! Отправлено {sent} сообщениям", reply_markup=main_menu())
+
+
+def process_welcome_change(message):
+    user_id = message.from_user.id
+    text = message.text
+
+    set_setting('welcome_msg', text)
+    bot.send_message(user_id, "✅ Приветствие обновлено!", reply_markup=main_menu())
+
+
+def process_bonus_change(message):
+    user_id = message.from_user.id
+    try:
+        percent = int(message.text)
+        if percent < 1 or percent > 100:
+            raise ValueError
+    except:
+        bot.send_message(user_id, "❌ Введите число от 1 до 100")
+        return
+
+    set_setting('bonus_percent', str(percent))
+    bot.send_message(user_id, f"✅ Бонус изменен на {percent}%", reply_markup=main_menu())
+
+
+def process_admin_add_balance(message):
+    user_id = message.from_user.id
+    try:
+        parts = message.text.split()
+        target_user = int(parts[0])
+        amount = float(parts[1])
+    except:
+        bot.send_message(user_id, "❌ Неверный формат. Используйте: ID Сумма")
+        return
+
+    add_balance(target_user, amount)
+    bot.send_message(user_id, f"✅ Начислено {amount}₽ пользователю {target_user}", reply_markup=main_menu())
+    try:
+        bot.send_message(target_user, f"💰 Администратор начислил вам {amount}₽ на баланс")
+    except:
+        pass
+
+
+def process_admin_sub_balance(message):
+    user_id = message.from_user.id
+    try:
+        parts = message.text.split()
+        target_user = int(parts[0])
+        amount = float(parts[1])
+    except:
+        bot.send_message(user_id, "❌ Неверный формат. Используйте: ID Сумма")
+        return
+
+    add_balance(target_user, -amount)
+    bot.send_message(user_id, f"✅ Списано {amount}₽ с пользователя {target_user}", reply_markup=main_menu())
+    try:
+        bot.send_message(target_user, f"💰 Администратор списал с вас {amount}₽")
+    except:
+        pass
+
+
+def process_create_promo(message):
+    user_id = message.from_user.id
+    try:
+        parts = message.text.split('|')
+        if len(parts) < 3:
+            raise ValueError
+        code = parts[0].strip().upper()
+        disc_type = parts[1].strip()
+        disc_value = float(parts[2].strip())
+    except:
+        bot.send_message(user_id, "❌ Неверный формат. Используйте: код|тип|значение")
+        return
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO promocodes (code, discount_type, discount_value, created_at) VALUES (?, ?, ?, ?)",
+              (code, disc_type, disc_value, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+    bot.send_message(user_id, f"✅ Промокод '{code}' создан!", reply_markup=main_menu())
+
+
+# ===== ПРОЦЕССЫ ДОБАВЛЕНИЯ ТОВАРА =====
+def process_add_product_name(message):
+    user_id = message.from_user.id
+    name = message.text
+
+    if not name:
+        bot.send_message(user_id, "❌ Введите название")
+        return
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+              (user_id, 'name', name))
+    conn.commit()
+    conn.close()
+
+    bot.send_message(user_id, "📝 Введите описание товара:")
+    bot.register_next_step_handler(message, process_add_product_desc)
+
+
+def process_add_product_desc(message):
+    user_id = message.from_user.id
+    desc = message.text
+
+    if not desc:
+        bot.send_message(user_id, "❌ Введите описание")
+        return
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+              (user_id, 'desc', desc))
+    conn.commit()
+    conn.close()
+
+    bot.send_message(user_id, "💰 Введите цену:")
+    bot.register_next_step_handler(message, process_add_product_price)
+
+
+def process_add_product_price(message):
+    user_id = message.from_user.id
+    try:
+        price = float(message.text.replace(',', '.'))
+    except:
+        bot.send_message(user_id, "❌ Введите число")
+        return
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+              (user_id, 'price', str(price)))
+    conn.commit()
+    conn.close()
+
+    categories = get_categories(0)
+    markup = InlineKeyboardMarkup(row_width=2)
+    for cat in categories:
+        markup.add(InlineKeyboardButton(cat[1], callback_data=f"prod_cat_{cat[0]}"))
+    markup.add(InlineKeyboardButton("🔙 Отмена", callback_data="admin_products"))
+    bot.send_message(user_id, "📂 Выберите категорию:", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("prod_cat_"))
+def select_product_category(call):
+    user_id = call.from_user.id
+    cat_id = int(call.data.split("_")[2])
+
+    subs = get_categories(cat_id)
+    if subs:
+        markup = InlineKeyboardMarkup(row_width=2)
+        for sub in subs:
+            markup.add(InlineKeyboardButton(sub[1], callback_data=f"prod_sub_{sub[0]}"))
+        markup.add(InlineKeyboardButton("Пропустить", callback_data=f"prod_sub_skip_{cat_id}"))
+        bot.edit_message_text("📂 Выберите подкатегорию:", user_id, call.message.message_id, reply_markup=markup)
+    else:
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+                  (user_id, 'category', str(cat_id)))
+        c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+                  (user_id, 'subcategory', '0'))
+        conn.commit()
+        conn.close()
+        ask_delivery_type(user_id, call.message)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("prod_sub_skip_"))
+def skip_subcategory(call):
+    user_id = call.from_user.id
+    cat_id = int(call.data.split("_")[3])
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+              (user_id, 'category', str(cat_id)))
+    c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+              (user_id, 'subcategory', '0'))
+    conn.commit()
+    conn.close()
+    ask_delivery_type(user_id, call.message)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("prod_sub_"))
+def select_product_subcategory(call):
+    user_id = call.from_user.id
+    sub_id = int(call.data.split("_")[2])
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT parent_id FROM categories WHERE id=?", (sub_id,))
+    cat_id = c.fetchone()[0]
+
+    c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+              (user_id, 'category', str(cat_id)))
+    c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+              (user_id, 'subcategory', str(sub_id)))
+    conn.commit()
+    conn.close()
+    ask_delivery_type(user_id, call.message)
+
+
+def ask_delivery_type(user_id, msg):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("✅ Авто-выдача", callback_data="prod_auto_yes"),
+        InlineKeyboardButton("👤 Ручная выдача", callback_data="prod_auto_no")
+    )
+    if isinstance(msg, types.Message):
+        bot.edit_message_text("📦 Выберите тип выдачи:", user_id, msg.message_id, reply_markup=markup)
+    else:
+        bot.send_message(user_id, "📦 Выберите тип выдачи:", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("prod_auto_"))
+def set_delivery_type(call):
+    user_id = call.from_user.id
+    auto = 1 if call.data == "prod_auto_yes" else 0
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+              (user_id, 'auto', str(auto)))
+    conn.commit()
+    conn.close()
+
+    if auto == 1:
+        bot.edit_message_text("📦 Введите данные для выдачи (логин:пароль или ссылка):",
+                              user_id, call.message.message_id)
+        bot.register_next_step_handler(call.message, process_delivery_data)
+    else:
+        ask_require_code(user_id, call.message)
+
+
+def process_delivery_data(message):
+    user_id = message.from_user.id
+    data = message.text
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+              (user_id, 'delivery_data', data))
+    conn.commit()
+    conn.close()
+
+    ask_require_code(user_id, message)
+
+
+def ask_require_code(user_id, msg):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🔑 Требуется код", callback_data="prod_code_yes"),
+        InlineKeyboardButton("🚫 Без кода", callback_data="prod_code_no")
+    )
+    if isinstance(msg, types.Message):
+        bot.send_message(user_id, "🔐 Требуется код для входа?", reply_markup=markup)
+    else:
+        bot.edit_message_text("🔐 Требуется код для входа?", user_id, msg.message_id, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("prod_code_"))
+def set_require_code(call):
+    user_id = call.from_user.id
+    require = 1 if call.data == "prod_code_yes" else 0
+
+    if require == 1:
+        bot.edit_message_text("🔑 Введите код для входа:", user_id, call.message.message_id)
+        bot.register_next_step_handler(call.message, process_code_data)
+    else:
+        save_product(user_id, call.message)
+
+
+def process_code_data(message):
+    user_id = message.from_user.id
+    code_data = message.text
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO temp_product_data (user_id, step, data) VALUES (?, ?, ?)",
+              (user_id, 'code_data', code_data))
+    conn.commit()
+    conn.close()
+    save_product(user_id, message)
+
+
+def save_product(user_id, msg):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+
+    c.execute("SELECT step, data FROM temp_product_data WHERE user_id=?", (user_id,))
+    data = {row[0]: row[1] for row in c.fetchall()}
+
+    if all(k in data for k in ['name', 'desc', 'price', 'category', 'subcategory', 'auto']):
+        c.execute("""INSERT INTO products 
+                     (name, description, price, category_id, subcategory_id, auto_delivery, delivery_data, require_code, code_data)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (data['name'], data['desc'], float(data['price']), int(data['category']),
+                   int(data['subcategory']), int(data['auto']),
+                   data.get('delivery_data', ''),
+                   1 if 'code_data' in data else 0,
+                   data.get('code_data', '')))
+
+        c.execute("DELETE FROM temp_product_data WHERE user_id=?", (user_id,))
+        conn.commit()
+        conn.close()
+
+        bot.send_message(user_id, "✅ Товар успешно добавлен!", reply_markup=main_menu())
+    else:
+        conn.close()
+        bot.send_message(user_id, "❌ Ошибка! Не все данные заполнены")
+
+
+def process_add_category(message):
+    user_id = message.from_user.id
+    name = message.text
+
+    if not name:
+        bot.send_message(user_id, "❌ Введите название")
+        return
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO categories (name, level) VALUES (?, 0)", (name,))
+    conn.commit()
+    conn.close()
+
+    bot.send_message(user_id, f"✅ Категория '{name}' добавлена!", reply_markup=main_menu())
+
+
+def process_add_subcategory(message, parent_id):
+    user_id = message.from_user.id
+    name = message.text
+
+    if not name:
+        bot.send_message(user_id, "❌ Введите название")
+        return
+
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO categories (name, parent_id, level) VALUES (?, ?, 1)", (name, parent_id))
+    conn.commit()
+    conn.close()
+
+    bot.send_message(user_id, f"✅ Подкатегория '{name}' добавлена!", reply_markup=main_menu())
+
+
+# ===== ЗАПУСК =====
+if __name__ == "__main__":
+    print("🤖 Бот запущен...")
+    print(f"👥 Админы: {ADMIN_IDS}")
+    print("📋 Номера заказов имеют формат: PREFIX-YYMMDD-XXXXXX")
+    print("💳 Работает только с балансом (без внешних платежей)")
+    bot.polling(none_stop=True)
